@@ -170,15 +170,17 @@ groupshared uint  gs_BehindMasksOfVerts[VERTS_PER_GROUP]; // 6 planes each (HLSL
 // 1 array *  16 elements * 4 bytes each = 64 bytes.
 groupshared uint  gs_CullClipFaceMasks[LIGHTS_PER_GROUP]; // 6 faces  each (HLSL does not support small data types)
 
-// 6 arrays * 16 elements * 4 bytes each = 384 bytes.
+// 8 arrays * 16 elements * 4 bytes each = 512 bytes.
 // These are actually floats reinterpreted as uints.
 // The reason is because floating-point atomic operations are not supported.
 groupshared uint  gs_RapAaBbMinPtX[LIGHTS_PER_GROUP];
 groupshared uint  gs_RapAaBbMaxPtX[LIGHTS_PER_GROUP];
 groupshared uint  gs_RapAaBbMinPtY[LIGHTS_PER_GROUP];
 groupshared uint  gs_RapAaBbMaxPtY[LIGHTS_PER_GROUP];
-groupshared uint  gs_RapAaBbMinPtZ[LIGHTS_PER_GROUP];
-groupshared uint  gs_RapAaBbMaxPtZ[LIGHTS_PER_GROUP];
+groupshared uint  gs_RapAaBbMinPtZ[LIGHTS_PER_GROUP]; // The W component is only stored to maintain
+groupshared uint  gs_RapAaBbMaxPtZ[LIGHTS_PER_GROUP]; // compatibility with the legacy clustered
+groupshared uint  gs_RapAaBbMinPtW[LIGHTS_PER_GROUP]; // lighting system. Reconstructing min-W from
+groupshared uint  gs_RapAaBbMaxPtW[LIGHTS_PER_GROUP]; // min-Z is non-trivial for oblique projections.
 #endif // USE_WAVE_INTRINSICS
 
 // Returns 'true' if it manages to cull the face.
@@ -290,8 +292,8 @@ void ClipPolygonAgainstPlane(uint p, uint srcBegin, uint srcSize,
     }
 }
 
-void ClipFaceAgainstViewVolumeAndUpdateAaBb(uint f, uint behindMasksOfVerts[NUM_VERTS], uint firstVertexOffset,
-                                            inout float3 rapAaBbMinPt, inout float3 rapAaBbMaxPt)
+void ClipFaceAgainstViewVolumeAndUpdateAaBb(uint f, uint behindMasksOfVerts[NUM_VERTS], uint firstVertexOffset, float4x4 g_mInvProjection,
+                                            inout float4 rapAaBbMinPt, inout float4 rapAaBbMaxPt)
 {
     float4 vertRingBuffer[MAX_CLIP_VERTS];
     uint srcBegin = 0, srcSize = 4;
@@ -340,11 +342,15 @@ void ClipFaceAgainstViewVolumeAndUpdateAaBb(uint f, uint behindMasksOfVerts[NUM_
         uint modSrcIdx = j % MAX_CLIP_VERTS;
     #endif
 
-        float4 hapVert = vertRingBuffer[modSrcIdx];
-        float3 rapVert = saturate(hapVert.xyz * rcp(hapVert.w)); // Must not generate negative values
+        float4 hapVert    = vertRingBuffer[modSrcIdx];
+        float4 hbpVertVS  = mul(g_mInvProjection, hapVert);         // Just to support orthographic projection
+        float3 rapVertNDC = saturate(hapVert.xyz * rcp(hapVert.w)); // Must not generate negative values
+        float  rbpVertVSz = hbpVertVS.z * rcp(hbpVertVS.w);
 
-        rapAaBbMinPt = min(rapAaBbMinPt, rapVert);
-        rapAaBbMaxPt = max(rapAaBbMaxPt, rapVert);
+        rapAaBbMinPt.xyz  = min(rapAaBbMinPt.xyz, rapVertNDC);
+        rapAaBbMaxPt.xyz  = max(rapAaBbMaxPt.xyz, rapVertNDC);
+        rapAaBbMinPt.w    = min(rapAaBbMinPt.w,   rbpVertVSz);
+        rapAaBbMaxPt.w    = max(rapAaBbMaxPt.w,   rbpVertVSz);
 
     #ifdef DUMB_COMPILER
         modSrcIdx++;
@@ -450,11 +456,13 @@ void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
         gs_RapAaBbMaxPtY[groupLocalLightIndex]     = asuint(0.0f);
         gs_RapAaBbMinPtZ[groupLocalLightIndex]     = asuint(1.0f);
         gs_RapAaBbMaxPtZ[groupLocalLightIndex]     = asuint(0.0f);
+        gs_RapAaBbMinPtW[groupLocalLightIndex]     = asuint(FLT_INF);
+        gs_RapAaBbMaxPtW[groupLocalLightIndex]     = asuint(0.0f);
     }
 #endif // USE_WAVE_INTRINSICS
 
-    float3 rapAaBbMinPt = 1;
-    float3 rapAaBbMaxPt = 0;
+    float4 rapAaBbMinPt = float4(1, 1, 1, FLT_INF);
+    float4 rapAaBbMaxPt = 0;
 
     // We must determine whether we have to clip or cull any of the faces.
     // If all vertices of a face are inside with respect to all the culling planes,
@@ -484,11 +492,11 @@ void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
 
         m.xy *= (v >= 4) ? 1 : scale;
 
-        float3 rbpVert = rbpC + m.x * rbpX + m.y * rbpY + m.z * rbpZ;
+        float3 rbpVertVS = rbpC + m.x * rbpX + m.y * rbpY + m.z * rbpZ;
         // Avoid generating (w = 0).
-        rbpVert.z = (abs(rbpVert.z) > FLT_MIN) ? rbpVert.z : FLT_MIN;
+        rbpVertVS.z = (abs(rbpVertVS.z) > FLT_MIN) ? rbpVertVS.z : FLT_MIN;
 
-        float4 hapVert = mul(g_mProjection, float4(rbpVert, 1));
+        float4 hapVert = mul(g_mProjection, float4(rbpVertVS, 1));
 
         // Warning: the W component may be negative.
         // Flipping the -W pyramid by negating all coordinates is incorrect
@@ -496,6 +504,8 @@ void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
 
         // Transform the X and Y components: [-w, w] -> [0, w].
         hapVert.xy = 0.5 * hapVert.xy + (0.5 * hapVert.w);
+
+        // TODO: multiply vertex by ViewZ if orthographic for unified processing!
 
         // For each vertex, we must determine whether it is within the bounds.
         // For culling and clipping, we must know, per culling plane, whether the vertex
@@ -520,10 +530,12 @@ void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
 
         if (behindMask == 0) // Inside?
         {
-            float3 rapVert = saturate(hapVert.xyz * rcp(hapVert.w)); // Must not generate negative values
+            float3 rapVertNDC = saturate(hapVert.xyz * rcp(hapVert.w)); // Must not generate negative values
 
-            rapAaBbMinPt = min(rapAaBbMinPt, rapVert);
-            rapAaBbMaxPt = max(rapAaBbMaxPt, rapVert);
+            rapAaBbMinPt.xyz = min(rapAaBbMinPt.xyz, rapVertNDC);
+            rapAaBbMaxPt.xyz = max(rapAaBbMaxPt.xyz, rapVertNDC);
+            rapAaBbMinPt.w   = min(rapAaBbMinPt.w,   rbpVertVS.z);
+            rapAaBbMaxPt.w   = max(rapAaBbMaxPt.w,   rbpVertVS.z);
         }
         else // Outside
         {
@@ -612,10 +624,12 @@ void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
             if (inside)
             {
                 float3 rapVertNDC = float3(rapVertCS.xy * 0.5 + 0.5, rapVertCS.z);
+                float  rbpVertVSz = hbpVertVS.z * rcp(hbpVertVS.w);
 
-                // Update the AABB.
-                rapAaBbMinPt = min(rapAaBbMinPt, rapVertNDC);
-                rapAaBbMaxPt = max(rapAaBbMaxPt, rapVertNDC);
+                rapAaBbMinPt.xyz = min(rapAaBbMinPt.xyz, rapVertNDC);
+                rapAaBbMaxPt.xyz = max(rapAaBbMaxPt.xyz, rapVertNDC);
+                rapAaBbMinPt.w   = min(rapAaBbMinPt.w,   rbpVertVSz);
+                rapAaBbMaxPt.w   = max(rapAaBbMaxPt.w,   rbpVertVSz);
             }
         }
     }
@@ -671,7 +685,7 @@ void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
             {
                 uint f = NthBitLow(clipFaceMask, n);
 
-                ClipFaceAgainstViewVolumeAndUpdateAaBb(f, behindMasksOfVerts, firstVertexOffset,
+                ClipFaceAgainstViewVolumeAndUpdateAaBb(f, behindMasksOfVerts, firstVertexOffset, g_mInvProjection,
                                                        rapAaBbMinPt, rapAaBbMaxPt);
             }
         }
@@ -688,6 +702,8 @@ void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
     InterlockedMax(gs_RapAaBbMaxPtY[groupLocalLightIndex], asuint(CLEAR_SIGN_BIT(rapAaBbMaxPt.y)));
     InterlockedMin(gs_RapAaBbMinPtZ[groupLocalLightIndex], asuint(CLEAR_SIGN_BIT(rapAaBbMinPt.z)));
     InterlockedMax(gs_RapAaBbMaxPtZ[groupLocalLightIndex], asuint(CLEAR_SIGN_BIT(rapAaBbMaxPt.z)));
+    InterlockedMin(gs_RapAaBbMinPtW[groupLocalLightIndex], asuint(CLEAR_SIGN_BIT(rapAaBbMinPt.w)));
+    InterlockedMax(gs_RapAaBbMaxPtW[groupLocalLightIndex], asuint(CLEAR_SIGN_BIT(rapAaBbMaxPt.w)));
 
     GroupMemoryBarrierWithGroupSync();
 
@@ -697,6 +713,8 @@ void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
     rapAaBbMaxPt.y = asfloat(gs_RapAaBbMaxPtY[groupLocalLightIndex]);
     rapAaBbMinPt.z = asfloat(gs_RapAaBbMinPtZ[groupLocalLightIndex]);
     rapAaBbMaxPt.z = asfloat(gs_RapAaBbMaxPtZ[groupLocalLightIndex]);
+    rapAaBbMinPt.w = asfloat(gs_RapAaBbMinPtW[groupLocalLightIndex]);
+    rapAaBbMaxPt.w = asfloat(gs_RapAaBbMaxPtW[groupLocalLightIndex]);
 #endif // USE_WAVE_INTRINSICS
 
     if (t % THREADS_PER_LIGHT == 0) // Avoid bank conflicts
@@ -706,8 +724,8 @@ void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
         // a set of maxs, and each set is equal to g_iNrVisibLights.
         const ScreenSpaceBoundsIndices boundsIndices = GenerateScreenSpaceBoundsIndices(lgtIndex, g_iNrVisibLights, eyeIndex);
 
-        g_vBoundsBuffer[boundsIndices.min] = float4(rapAaBbMinPt, 0);      // TODO: add me - lin depth
-        g_vBoundsBuffer[boundsIndices.max] = float4(rapAaBbMaxPt, 100000); //
+        g_vBoundsBuffer[boundsIndices.min] = rapAaBbMinPt;
+        g_vBoundsBuffer[boundsIndices.max] = rapAaBbMaxPt;
     }
 
 #else // !Z_BINNING
